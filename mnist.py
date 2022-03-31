@@ -119,6 +119,7 @@ parser.add_argument('--mage', action='store_true', default=False, help="Daniel's
 parser.add_argument('--per-batch', action='store_true', default=False, help="Calc V per batch")
 parser.add_argument('--finite-diff', action='store_true', default=False, help="use finite diff")
 parser.add_argument('--fwd-mode', action='store_true', default=False, help="use forward mode")
+parser.add_argument('--resample', action='store_true', default=False, help="sampe new delta for each minibatch")
 
 parser.add_argument('--directional', action='store_true', default=False, help="use backprop with directional derivative")
 
@@ -128,6 +129,8 @@ parser.add_argument('--dont-normalize', dest="normalize_v", action='store_false'
 parser.add_argument('--double', action='store_true', default=False, help="double precision")
 
 parser.add_argument('--replicates', default=0, type=int, help="replicates")
+
+
 
 parser.set_defaults(augment=True)
 
@@ -150,9 +153,9 @@ def count_parameters(model):
 
 def auto_name(args):
     if args.first is None:
-        txt = f"{args.dataset}_{args.arch}_{args.layers}x{args.widening}_B{args.batch_size}_"
+        txt = f"{args.dataset}_{args.arch}_{args.layers}x{args.widening}_B{args.batch_size}_V2_"
     else:
-        txt = f"{args.dataset}_{args.arch}_{args.layers}-{args.first}x{args.widening}_B{args.batch_size}_"
+        txt = f"{args.dataset}_{args.arch}_{args.layers}-{args.first}x{args.widening}_B{args.batch_size}_V2_"
 
     loglr = round(np.log(args.lr)/np.log(10))
     lead = round(args.lr / (10**loglr))
@@ -160,9 +163,14 @@ def auto_name(args):
     lr = f"{lead}E{loglr}"
     txt = txt + f"LR{lr}_"
 
+    if not args.cosine:
+        txt = txt + "noCosine_"
+
     if args.double:
         txt = txt + "fp32_"
 
+    if args.resample:
+        txt = txt + "resample_"
 
     if args.finite_diff or args.fwd_mode:
         if args.finite_diff:
@@ -324,7 +332,7 @@ def main():
     for epoch in range(args.start_epoch,args.epochs//args.epoch_scale):
 
         if args.fwd_mode:
-            train_loss,train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage)
+            train_loss,train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample)
         elif args.finite_diff:
             train_loss,train_acc = train_v(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage)
         else:
@@ -380,7 +388,7 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
 
 
 
-    for i, (input, target) in tqdm(enumerate(train_loader), total = len(train_loader)):
+    for j, (input, target) in tqdm(enumerate(train_loader), total = len(train_loader)):
 
         optimizer.zero_grad()
 
@@ -466,7 +474,7 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
 
 
     train_acc = (100. * correct / len(train_loader.dataset))
-    train_loss = train_loss/(i+1)
+    train_loss = train_loss/total
     
     if writer is not None:
         writer.add_scalar('train/loss', train_loss, epoch)
@@ -563,7 +571,7 @@ def train_v(train_loader, model, args, optimizer, scheduler, epoch, device, writ
 
 
     train_acc = (100. * correct / len(train_loader.dataset))
-    train_loss = train_loss/(i+1)
+    train_loss = train_loss/total
     if writer is not None:
         writer.add_scalar('train/loss', train_loss, epoch)
         writer.add_scalar('train/acc', train_acc, epoch)
@@ -646,7 +654,7 @@ class MSELoss(_WeightedLoss):
         return self.reduce_loss(preds.sum(dim=-1))
 
 
-def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False):
+def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False):
     """Train for one epoch on the training set"""
     # switch to train mode
     watcher = True
@@ -680,7 +688,7 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         #     import pdb; pdb.set_trace();
 
 
-        out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch)        
+        out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, resample = resample)        
         
         loss = F.cross_entropy(out, target, reduction  = 'mean')
 
@@ -701,7 +709,7 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
             print(f"Turned Nan on step {i}")
 
     train_acc = (100. * correct / len(train_loader.dataset))
-    train_loss = train_loss/(i+1)
+    train_loss = train_loss/total
     if writer is not None:
         writer.add_scalar('train/loss', train_loss, epoch)
         writer.add_scalar('train/acc', train_acc, epoch)

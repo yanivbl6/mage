@@ -530,7 +530,7 @@ class PlainFC(nn.Module):
         return x,x2,V 
 
 
-    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0):
+    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True):
 
         tot_norm = 0
         epsilon = 1
@@ -556,15 +556,26 @@ class PlainFC(nn.Module):
                 if mage:
                     ##import pdb; pdb.set_trace()
 
+                    if resample:
 
-                    vn = torch.randn([W.shape[0],1],device =device, dtype = dtype) *epsilon 
-                    vb = vn.clone().squeeze().expand(B.shape)
+                        vb = torch.randn([batch_size,W.shape[0]],device =device, dtype = dtype) *epsilon 
+                                                
+                        if normalize_v:
+                            z = x/(x.norm(dim=1,keepdim = True)+ eps)  ## B X N
+                            vw = torch.matmul(vb.unsqueeze(2),z.unsqueeze(1))   ##   B X       mm    B X 1 X N
+                        else:
+                            vw = torch.matmul(vb.unsqueeze(2),x.unsqueeze(1))
 
-                    if normalize_v:
-                        z = x/(x.norm(dim=1,keepdim = True)+ eps)
-                        vw = torch.matmul(vn,z.unsqueeze(1))
+
                     else:
-                        vw = torch.matmul(vn,x.unsqueeze(1))
+                        vn = torch.randn([W.shape[0],1],device =device, dtype = dtype) *epsilon 
+                        vb = vn.clone().squeeze().expand(B.shape)
+
+                        if normalize_v:
+                            z = x/(x.norm(dim=1,keepdim = True)+ eps)
+                            vw = torch.matmul(vn,z.unsqueeze(1))
+                        else:
+                            vw = torch.matmul(vn,x.unsqueeze(1))
 
                     new_grad = torch.matmul(vw, x.unsqueeze(2)).squeeze() + vb   ## B x N1
 
@@ -633,7 +644,10 @@ class PlainFC(nn.Module):
             if not per_batch and mage:
                 linop.weight.grad = torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2]) * (delta**K)   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
                 if not linop.bias is None:
-                    linop.bias.grad = dFg.sum() * vb * (delta**K)
+                    if resample:
+                        linop.bias.grad = (dFg* vb).sum(0) * (delta**K)
+                    else:
+                        linop.bias.grad = dFg.sum() * vb * (delta**K)
 
             else:
                 linop.weight.grad = dFg* vw * (delta**K)
