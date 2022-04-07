@@ -405,12 +405,13 @@ class PlainFC(nn.Module):
         last_ch = layer_specs[0]
         self.act = str2act(self.actstr,self.lamb)
 
+        self.num_neurons = np.sum(layer_specs[1:]) + classes
+
         if layers > 0:
             op = nn.Linear(last_ch, layer_specs[1], bias = True)
             init_layer(op)
             self.linops.append(op)
             last_ch = layer_specs[1]
-
 
         for i,ch_out in enumerate(layer_specs[2:]):
 
@@ -425,6 +426,8 @@ class PlainFC(nn.Module):
         linop = nn.Linear(last_ch, classes, bias = True)
         self.linops.append(linop)
         print(self)
+        self.distinct_mapping = None
+
 
     def forward(self, x):
         
@@ -530,7 +533,8 @@ class PlainFC(nn.Module):
         return x,x2,V 
 
 
-    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True):
+
+    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True, sparsity = 0.0):
 
         tot_norm = 0
         epsilon = 1
@@ -538,18 +542,44 @@ class PlainFC(nn.Module):
         batch_size = x.shape[0]
         old_grad = None
         delta = 1
+
+        device =x.device
+        dtype = x.dtype
+
+
+
         with torch.no_grad():
             assert(self.actstr == "relu")
             src_shape = x.shape
             x = x.view(src_shape[0],-1) 
             V = {}
-            device =x.device
-            dtype = x.dtype
+
+
+            if resample:
+                num_neurons = self.num_neurons
+                if self.distinct_mapping is None:
+                    if (batch_size >  num_neurons):
+                        self.distinct_mapping  = torch.zeros([batch_size, num_neurons], device = device)
+                        self.distinct_mapping[:num_neurons,:] = torch.eye(num_neurons ,device = device)
+                    else:
+                        times = ((num_neurons+batch_size-1)//batch_size)
+                        self.distinct_mapping = torch.zeros([times*batch_size, num_neurons], device = device)
+                        self.distinct_mapping[:num_neurons,:] = torch.eye(num_neurons ,device = device)
+                        ## rest are zeros
+
+                if (batch_size >  num_neurons):
+                    sprase_mask = (torch.rand([batch_size-num_neurons,num_neurons],device = device) >= sparsity).to(torch.float)
+                    self.distinct_mapping[num_neurons:,:] = torch.randn([batch_size-num_neurons,num_neurons],device = device) * sprase_mask
+                    mmapping  = self.distinct_mapping[torch.randperm(batch_size),:]
+                else:
+                    self.distinct_mapping[:num_neurons,:] = self.distinct_mapping[torch.randperm(num_neurons),:]
+                    times = ((num_neurons+batch_size-1)//batch_size)
+                    mmapping = (self.distinct_mapping.view(times,batch_size,-1).sum(0))[torch.randperm(batch_size),:]                    
+                w_start_idx  =0
 
             for i,linop in enumerate(self.linops):
                 W = linop.weight
                 B = linop.bias
-
 
                 ##vb = torch.randn(B.shape,device =device, dtype = dtype) *epsilon
 
@@ -559,16 +589,29 @@ class PlainFC(nn.Module):
                     if resample:
 
                         vb = torch.randn([batch_size,W.shape[0]],device =device, dtype = dtype) *epsilon 
-                                                
+                        if False and sparsity > 0.0:
+                            vnmask = (torch.rand(vb.shape,device =device, dtype = dtype) >= sparsity).to(torch.float)
+                            vb = vb*vnmask
+                        else:
+                            ##import pdb; pdb.set_trace()
+                            w_end_idx =  w_start_idx + W.shape[0]
+                            vnmask = mmapping[:,w_start_idx:w_end_idx]
+                            w_start_idx = w_end_idx
+                            vb = vb*vnmask
+
                         if normalize_v:
                             z = x/(x.norm(dim=1,keepdim = True)+ eps)  ## B X N
-                            vw = torch.matmul(vb.unsqueeze(2),z.unsqueeze(1))   ##   B X       mm    B X 1 X N
+                            vw = torch.matmul(vb.unsqueeze(2),z.unsqueeze(1))   ##   B X M X 1    mm    B X 1 X N
                         else:
                             vw = torch.matmul(vb.unsqueeze(2),x.unsqueeze(1))
 
 
                     else:
                         vn = torch.randn([W.shape[0],1],device =device, dtype = dtype) *epsilon 
+                        if sparsity > 0.0:
+                            vnmask = (torch.rand(vn.shape,device =device, dtype = dtype) >= sparsity).to(torch.float)
+                            vn = vn*vnmask
+
                         vb = vn.clone().squeeze().expand(B.shape)
 
                         if normalize_v:
@@ -585,9 +628,8 @@ class PlainFC(nn.Module):
                 else:
                     vb = torch.randn(B.shape,device =device, dtype = dtype) *epsilon
                     vw = torch.randn(W.shape,device =device) *epsilon
-                    new_grad = F.linear(x, vw) + vb  ## B x N1
+                    new_grad = F.linear(x, vw) + vb  ## B x 1 X N1
 
-                V[i] = (vw, vb)
                 if not old_grad is None:
                     old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
                 else:
@@ -603,8 +645,14 @@ class PlainFC(nn.Module):
                 x = linop(x)
 
                 if i < len(self.linops) - 1:
-                    old_grad = old_grad * ((x >= 0).to(torch.float))
+                    ##import pdb; pdb.set_trace()
+                    mask  =  ((x >= 0).to(torch.float))
+                    old_grad = old_grad * mask ## B X N1
+                    maskd3 = mask.unsqueeze(2).expand( vw.shape)
+                    vw = vw * maskd3   ##  B X N2 X N1  mm  
+
                     x = self.act(x)
+                V[i] = (vw, vb)
 
                 
 

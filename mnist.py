@@ -130,6 +130,7 @@ parser.add_argument('--double', action='store_true', default=False, help="double
 
 parser.add_argument('--replicates', default=0, type=int, help="replicates")
 
+parser.add_argument('--sparsity', default=0.0, type=float, help='deltas sparsity')
 
 
 parser.set_defaults(augment=True)
@@ -170,7 +171,10 @@ def auto_name(args):
         txt = txt + "fp32_"
 
     if args.resample:
-        txt = txt + "resample_"
+        txt = txt + "resampleV2_"
+
+    if args.sparsity > 0.0:
+        txt = txt + f"sparse{int(args.sparsity*100)}_"
 
     if args.finite_diff or args.fwd_mode:
         if args.finite_diff:
@@ -178,7 +182,7 @@ def auto_name(args):
         else:
             txt = txt + "fwdModeV6_"
         if args.mage:
-            txt = txt + "mage_"
+            txt = txt + "mageV3_"##v2: fixed normalization
             if args.per_batch:
                 txt = txt + "PerBatchV4_"
             if args.normalize_v:
@@ -190,7 +194,7 @@ def auto_name(args):
         if args.directional:
             txt = txt + "directionalV2_"
             if args.mage:
-                txt = txt + "mage_"
+                txt = txt + "mage_" 
                 if args.normalize_v:
                     txt = txt + "Normalized_"
     if len(args.name) > 0:
@@ -307,6 +311,21 @@ def get_model(args):
 
     return model, dl_train, dl_val, device, aname, save_path
 
+def steps_lr(optimizer, args, epoch):
+    if epoch < 40:
+        lr = args.lr
+    elif epoch < 80:
+        lr = args.lr * 1e-1
+    elif epoch < 120:
+        lr = args.lr * 1e-2
+    elif epoch < 160:
+        lr = args.lr * 1e-3
+    else:
+        lr = args.lr * 1e-4
+    # lr = args.lr * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
 def main():
     global args
     args = parser.parse_args()
@@ -332,7 +351,7 @@ def main():
     for epoch in range(args.start_epoch,args.epochs//args.epoch_scale):
 
         if args.fwd_mode:
-            train_loss,train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample)
+            train_loss,train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity )
         elif args.finite_diff:
             train_loss,train_acc = train_v(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage)
         else:
@@ -471,6 +490,8 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
         optimizer.step()
         if args.cosine:
             scheduler.step()
+        else:
+            steps_lr(optimizer,args,epoch)
 
 
     train_acc = (100. * correct / len(train_loader.dataset))
@@ -568,7 +589,8 @@ def train_v(train_loader, model, args, optimizer, scheduler, epoch, device, writ
 
         if args.cosine:
             scheduler.step()
-
+        else:
+            steps_lr(optimizer,args,epoch)
 
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
@@ -654,7 +676,7 @@ class MSELoss(_WeightedLoss):
         return self.reduce_loss(preds.sum(dim=-1))
 
 
-def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False):
+def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False, sparsity = 0.0):
     """Train for one epoch on the training set"""
     # switch to train mode
     watcher = True
@@ -688,7 +710,7 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         #     import pdb; pdb.set_trace();
 
 
-        out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, resample = resample)        
+        out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
         
         loss = F.cross_entropy(out, target, reduction  = 'mean')
 
@@ -702,7 +724,8 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
 
         if args.cosine:
             scheduler.step()
-
+        else:
+            steps_lr(optimizer,args,epoch)
 
         if watcher and np.isnan(train_loss):
             watcher = False
