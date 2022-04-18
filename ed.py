@@ -689,6 +689,8 @@ class PlainFC(nn.Module):
         ##dFg = dFg * ((dFg >= 0).to(torch.float)) ## DELETE ME, I AM ERROR
 
         ##import pdb; pdb.set_trace()
+        import pdb; pdb.set_trace();
+
         for i in range(len(self.linops)):
 
             linop = self.linops[i]
@@ -715,7 +717,6 @@ class PlainFC(nn.Module):
                     linop.bias.grad +=  dFg * vb  * (delta**K) 
 
 
-        torch.nn.utils.clip_grad_norm_(self.parameters(), 0.3)
 
         return x
 
