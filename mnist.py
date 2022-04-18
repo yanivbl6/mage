@@ -17,6 +17,9 @@ import utils
 
 
 
+import tensorboard.backend.event_processing.event_accumulator as ea
+
+
 
 from ed import *
 from torch.distributions.beta import Beta
@@ -139,6 +142,24 @@ parser.add_argument('--rundir', type=str, default=".", help='Results dir name')
 
 
 parser.set_defaults(augment=True)
+
+
+
+def already_exists(path, epochs):
+    
+
+    if not os.path.exists(path):
+        return False
+    for event in os.listdir(path):
+        event_acc = ea.EventAccumulator(f"{path}/{event}")
+        event_acc.Reload()
+
+        print(f"{path}/{event}")
+        if 'test/loss' in event_acc.scalars.Keys():
+            if len(event_acc.scalars.Items('test/loss')) >= epochs:
+                return True
+    return False
+
 
 
 def parse_txt(cmd):
@@ -350,7 +371,13 @@ def main():
 
 
     print(f"name: {aname}")
-    writer = SummaryWriter(log_dir="%s/runs/%s" % (args.rundir,aname), comment=str(args))
+
+    writer_path = "%s/runs/%s" % (args.rundir,aname)
+    if already_exists(writer_path,args.epochs):
+        print("File already exists and is full: aborting")
+        return 0
+
+    writer = SummaryWriter(log_dir=writer_path, comment=str(args))
 
 
     loss_lst = []
