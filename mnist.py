@@ -133,6 +133,10 @@ parser.add_argument('--replicates', default=0, type=int, help="replicates")
 parser.add_argument('--sparsity', default=0.0, type=float, help='deltas sparsity')
 
 
+parser.add_argument('--ndirections', default=1, type=int, help='number of random directions to average on')
+
+
+
 parser.set_defaults(augment=True)
 
 
@@ -172,6 +176,9 @@ def auto_name(args):
 
     if args.resample:
         txt = txt + "resampleV2_"
+
+    if args.ndirections > 1:
+        txt = txt + f"{args.ndirections}-Directions"
 
     if args.sparsity > 0.0:
         txt = txt + f"sparse{int(args.sparsity*100)}_"
@@ -710,16 +717,18 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         #     import pdb; pdb.set_trace();
 
 
-        out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
-        
-        loss = F.cross_entropy(out, target, reduction  = 'mean')
+        for _ in range(args.ndirections):
+            out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
+            
+            loss = F.cross_entropy(out, target, reduction  = 'mean')/args.ndirections
 
-        pred = out.argmax(dim=1, keepdim=True) # get the index of the max log-probability
-        correct += pred.eq(target.view_as(pred)).sum().item()
+            pred = out.argmax(dim=1, keepdim=True) # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
 
-        train_loss += loss.item()
+            train_loss += loss.item()
+            total += input.size(0)
 
-        total += input.size(0)
+
         optimizer.step()
 
         if args.cosine:
