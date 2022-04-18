@@ -719,15 +719,12 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
 
         for _ in range(args.ndirections):
             out = model.fwd_mode(input, target, lambda x,y: mloss(x,y), mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
-            
             loss = F.cross_entropy(out, target, reduction  = 'mean')/args.ndirections
-
-            pred = out.argmax(dim=1, keepdim=True) # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-
             train_loss += loss.item()
             total += input.size(0)
 
+        pred = out.argmax(dim=1, keepdim=True) # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
 
         optimizer.step()
 
