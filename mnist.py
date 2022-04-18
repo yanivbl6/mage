@@ -320,16 +320,16 @@ def get_model(args):
     return model, dl_train, dl_val, device, aname, save_path
 
 def steps_lr(optimizer, args, epoch):
-    if epoch < 40:
+    if epoch < args.epochs//5:
         lr = args.lr
-    elif epoch < 80:
+    elif epoch < 2*args.epochs//5:
+        lr = args.lr * 3e-1
+    elif epoch < 3*args.epochs//5:
         lr = args.lr * 1e-1
-    elif epoch < 120:
+    elif epoch < 4*args.epochs//5:
         lr = args.lr * 1e-2
-    elif epoch < 160:
-        lr = args.lr * 1e-3
     else:
-        lr = args.lr * 1e-4
+        lr = args.lr * 1e-3
     # lr = args.lr * (0.1 ** (epoch // 30))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
