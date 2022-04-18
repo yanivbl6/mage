@@ -178,7 +178,7 @@ def auto_name(args):
         txt = txt + "resampleV2_"
 
     if args.ndirections > 1:
-        txt = txt + f"{args.ndirections}-Directions"
+        txt = txt + f"{args.ndirections}-Directions_"
 
     if args.sparsity > 0.0:
         txt = txt + f"sparse{int(args.sparsity*100)}_"
@@ -718,7 +718,7 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
 
 
         for _ in range(args.ndirections):
-            out = model.fwd_mode(input, target, lambda x,y: mloss(x,y),   mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
+            out = model.fwd_mode(input, target, lambda x,y: mloss(x,y), mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
             
             loss = F.cross_entropy(out, target, reduction  = 'mean')/args.ndirections
 

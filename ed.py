@@ -645,13 +645,12 @@ class PlainFC(nn.Module):
                 x = linop(x)
 
                 if i < len(self.linops) - 1:
-                    import pdb; pdb.set_trace()
                     mask  =  ((x >= 0).to(torch.float))
 
                     old_grad = old_grad * mask ## B X N1
                     if not mage:
-                        maskd3 = mask.unsqueeze(2).expand([batch_size, vn.size(0), vn.size(1) ])
-                        maskd3 = (mask.sum(0) > 0).to(torch.float)
+                        maskd3 = mask.unsqueeze(2).expand([batch_size, vw.size(0), vw.size(1) ])
+                        maskd3 = (mask.sum(0) > 0).to(torch.float).unsqueeze(1)
                     else:
                         maskd3 = mask.unsqueeze(2).expand( vw.shape)
 
@@ -693,22 +692,30 @@ class PlainFC(nn.Module):
         for i in range(len(self.linops)):
 
             linop = self.linops[i]
+            if linop.weight.grad is None:
+                linop.weight.grad = torch.zeros_like(linop.weight)
+                if not linop.bias is None:
+                    linop.bias.grad = torch.zeros_like(linop.bias)
+
+
+
             vw, vb = V[i]
             K = len(self.linops) -1 - i
             if not per_batch and mage:
-                linop.weight.grad += torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2]) * (delta**K)   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
+                linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2]) * (delta**K)   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
                 if not linop.bias is None:
                     if resample:
-                        linop.bias.grad += (dFg* vb).sum(0) * (delta**K)
+                        linop.bias.grad +=  (dFg* vb).sum(0) * (delta**K)
                     else:
-                        linop.bias.grad += dFg.sum() * vb * (delta**K)
+                        linop.bias.grad +=dFg.sum() * vb * (delta**K) 
 
             else:
-                linop.weight.grad += dFg* vw * (delta**K)
+                linop.weight.grad +=   dFg* vw * (delta**K) 
                 if not linop.bias is None:
-                    linop.bias.grad += dFg * vb  * (delta**K)
+                    linop.bias.grad +=  dFg * vb  * (delta**K) 
 
 
         torch.nn.utils.clip_grad_norm_(self.parameters(), 0.3)
 
         return x
+
