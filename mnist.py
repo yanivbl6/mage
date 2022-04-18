@@ -135,6 +135,7 @@ parser.add_argument('--sparsity', default=0.0, type=float, help='deltas sparsity
 
 parser.add_argument('--ndirections', default=1, type=int, help='number of random directions to average on')
 
+parser.add_argument('--rundir', type=str, default=".", help='Results dir name')
 
 
 parser.set_defaults(augment=True)
@@ -349,7 +350,7 @@ def main():
 
 
     print(f"name: {aname}")
-    writer = SummaryWriter(log_dir="runs/%s" % aname, comment=str(args))
+    writer = SummaryWriter(log_dir="%s/runs/%s" % (args.rundir,aname), comment=str(args))
 
 
     loss_lst = []
