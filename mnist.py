@@ -145,12 +145,13 @@ parser.set_defaults(augment=True)
 
 
 
-def already_exists(path, epochs):
+def already_exists(path, epochs, delete = True):
     
 
     if not os.path.exists(path):
         return False
-    for event in os.listdir(path):
+    dirslist = os.listdir(path)
+    for event in dirslist:
         event_acc = ea.EventAccumulator(f"{path}/{event}")
         event_acc.Reload()
 
@@ -158,6 +159,9 @@ def already_exists(path, epochs):
         if 'test/loss' in event_acc.scalars.Keys():
             if len(event_acc.scalars.Items('test/loss')) >= epochs:
                 return True
+        if delete:
+            os.remove(f"{path}/{event}")
+        
     return False
 
 
