@@ -371,7 +371,12 @@ def main():
 
     # cosine learning rate
     ##scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, ((len(train_loaders)*args.levels)//args.M)*args.epochs)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, (len(dl_train))*(args.epochs//args.epoch_scale))
+    num_steps = (len(dl_train))*(args.epochs//args.epoch_scale)
+
+    if args.cosine:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, num_steps)
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, num_steps//5, gamma=np.sqrt(0.1))
 
 
     print(f"name: {aname}")
@@ -530,7 +535,8 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
         if args.cosine:
             scheduler.step()
         else:
-            steps_lr(optimizer,args,epoch)
+            scheduler.step()
+##            steps_lr(optimizer,args,epoch)
 
 
     train_acc = (100. * correct / len(train_loader.dataset))
@@ -547,6 +553,8 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
             writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
             if not linop.bias is None:
                 writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+
+        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
 
     return train_loss, train_acc
 
@@ -629,7 +637,8 @@ def train_v(train_loader, model, args, optimizer, scheduler, epoch, device, writ
         if args.cosine:
             scheduler.step()
         else:
-            steps_lr(optimizer,args,epoch)
+            scheduler.step()
+##            steps_lr(optimizer,args,epoch)
 
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
@@ -645,6 +654,9 @@ def train_v(train_loader, model, args, optimizer, scheduler, epoch, device, writ
             writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
             if not linop.bias is None:
                 writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+
+        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
+
 
     return train_loss, train_acc
 
@@ -764,7 +776,9 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         if args.cosine:
             scheduler.step()
         else:
-            steps_lr(optimizer,args,epoch)
+            scheduler.step()
+##            steps_lr(optimizer,args,epoch)
+
 
         if watcher and np.isnan(train_loss):
             watcher = False
@@ -785,6 +799,7 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
             if not linop.bias is None:
                 writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
 
+        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
 
     return train_loss, train_acc
 
