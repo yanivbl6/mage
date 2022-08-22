@@ -14,6 +14,7 @@ import torchvision.datasets as datasets
 from torch.utils.data import random_split
 import utils
 
+import wandb
 
 
 
@@ -74,7 +75,7 @@ parser.add_argument('--cont-src', default="", type=str,
 
 parser.add_argument('--name', type=str, default="", help='Name of event file')
 
-parser.add_argument('--arch', default="ED-FC", type=str,
+parser.add_argument('--arch', default="fc", type=str,
                     help='architecture')
 
 parser.add_argument('-D', '--tD', action='store_true', default=False,
@@ -126,6 +127,8 @@ parser.add_argument('--resample', action='store_true', default=False, help="samp
 
 parser.add_argument('--directional', action='store_true', default=False, help="use backprop with directional derivative")
 
+parser.add_argument('--rb', action='store_true', default=False, help="use reverse backprop mage")
+
 
 parser.add_argument('--epoch-scale', default=1, type=int, help="epoch multiplier")
 parser.add_argument('--dont-normalize', dest="normalize_v", action='store_false', default=True, help="normalize V")
@@ -139,6 +142,13 @@ parser.add_argument('--sparsity', default=0.0, type=float, help='deltas sparsity
 parser.add_argument('--ndirections', default=1, type=int, help='number of random directions to average on')
 
 parser.add_argument('--rundir', type=str, default=".", help='Results dir name')
+
+parser.add_argument('-I','--inv', type=str, default="pinv", help='type of inverse')
+parser.add_argument('--naive', action='store_true', default=False, help='dont do transformation for RB')
+
+parser.add_argument('--binary', action='store_true', default=False, help='use binary mask for directions')
+
+parser.add_argument('--log-eigens', action='store_true', default=False, help='log eigenvalues for J')
 
 
 parser.set_defaults(augment=True)
@@ -252,7 +262,8 @@ def get_model(args):
 
     # Data loading code
 
-
+    wandb.init(project="mage-fc", entity="dl-projects" )
+    wandb.config.update(args)
 
 
     print('==> Preparing data..')
@@ -378,30 +389,34 @@ def main():
     else:
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, num_steps//5, gamma=np.sqrt(0.1))
 
-
     print(f"name: {aname}")
+    # writer_path = "%s/runs/%s" % (args.rundir,aname)
+    # if already_exists(writer_path,args.epochs):
+    #     print("File already exists and is full: aborting")
+    #     return 0
 
-    writer_path = "%s/runs/%s" % (args.rundir,aname)
-    if already_exists(writer_path,args.epochs):
-        print("File already exists and is full: aborting")
-        return 0
-
-    writer = SummaryWriter(log_dir=writer_path, comment=str(args))
+    writer = None ##SummaryWriter(log_dir=writer_path, comment=str(args))
 
 
     loss_lst = []
     test_loss_lst = []
 
+    table = None
+
+    if args.log_eigens:
+        all_eigs = []
+        table = wandb.Table(columns=["epoch","layer","eigs"])
+    
     for epoch in range(args.start_epoch,args.epochs//args.epoch_scale):
 
         if args.fwd_mode:
-            train_loss,train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity )
+            train_loss, train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
         elif args.finite_diff:
-            train_loss,train_acc = train_v(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage)
+            train_loss, train_acc = train_v(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage)
         else:
             train_loss,train_acc = train(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer)
 
-        test_loss, test_acc = test(dl_val, model, args, device, epoch*args.epoch_scale , writer)
+        test_loss, test_acc = test(dl_val, model, args, device, epoch*args.epoch_scale, table , writer)
         loss_lst.append(train_loss)
         test_loss_lst.append(test_loss)
 
@@ -409,6 +424,7 @@ def main():
         print('Train Loss: %.3f | Test Loss: %.3f | Train Accuracy: %.3f | Test Accuracy: %.3f ' % (train_loss, test_loss, train_acc, test_acc))
 
     print('Finished training!')
+
 
 
     loss_lst = np.asarray(loss_lst)
@@ -483,7 +499,6 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
                 epsilon = 1
                 eps = 1E-6
 
-
                 dFg = 0
 
                 for i, linop in enumerate(model.linops):
@@ -542,19 +557,20 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
     
-    if writer is not None:
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('train/acc', train_acc, epoch)
-        for i,linop in enumerate(model.linops) :
-            if i == 0:
-                stri=""
-            else:
-                stri = f"{i}"
-            writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
-            if not linop.bias is None:
-                writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+    wandb.log({"Epoch": epoch,
+                "Train Loss": train_loss,
+                "Train Acc": train_acc,
+                "Learning Rate: ": optimizer.param_groups[0]['lr']})
 
-        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
+
+        # for i,linop in enumerate(model.linops) :
+        #     if i == 0:
+        #         stri=""
+        #     else:
+        #         stri = f"{i}"
+        #     writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
+        #     if not linop.bias is None:
+        #         writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
 
     return train_loss, train_acc
 
@@ -726,8 +742,7 @@ class MSELoss(_WeightedLoss):
 
         return self.reduce_loss(preds.sum(dim=-1))
 
-
-def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False, sparsity = 0.0):
+def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False, sparsity = 0.0,binary  =False):
     """Train for one epoch on the training set"""
     # switch to train mode
     watcher = True
@@ -761,7 +776,15 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         #     import pdb; pdb.set_trace();
 
         for _ in range(args.ndirections):
-            out = model.fwd_mode(input, target, lambda x,y: mloss(x,y)/args.ndirections, mage = mage,  epsilon = epsilon, per_batch = args.per_batch, normalize_v = args.normalize_v, resample = resample, sparsity = sparsity)        
+
+            if args.rb:
+                out = model.fwd_rb_mode(input, target, lambda x,y: mloss(x,y)/args.ndirections, transform = not args.naive, inv = args.inv)
+            else:
+                out = model.fwd_mode(input, target, lambda x,y: mloss(x,y)/args.ndirections, 
+                                    mage = mage,  epsilon = epsilon, per_batch = args.per_batch, 
+                                    normalize_v = args.normalize_v, resample = resample, sparsity = sparsity, binary = binary)
+                
+
             loss = F.cross_entropy(out, target, reduction  = 'mean')/args.ndirections
             train_loss += loss.item()
             total += input.size(0)
@@ -786,20 +809,20 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
 
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
-    if writer is not None:
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('train/acc', train_acc, epoch)
 
-        for i,linop in enumerate(model.linops) :
-            if i == 0:
-                stri=""
-            else:
-                stri = f"{i}"
-            writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
-            if not linop.bias is None:
-                writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+    wandb.log({"Epoch": epoch,
+                "Train Loss": train_loss,
+                "Train Acc": train_acc,
+                "Learning Rate: ": optimizer.param_groups[0]['lr']})
 
-        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
+        # for i,linop in enumerate(model.linops) :
+        #     if i == 0:
+        #         stri=""
+        #     else:
+        #         stri = f"{i}"
+        #     writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
+        #     if not linop.bias is None:
+        #         writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
 
     return train_loss, train_acc
 
@@ -807,40 +830,59 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
 
 
 
-def test(test_loader, model, args, device, epoch, writer=None):
+def test(test_loader, model, args, device, epoch, table = None, writer=None):
     """Perform test on the test set"""
     # switch to evaluate mode
     model.eval()
     test_loss = 0
     total = 0
     correct = 0
+
+
     for i, (input, target) in tqdm(enumerate(test_loader), total = len(test_loader)):
+
+
+
+
         input = input.to(device)
         target = target.to(device)
 
         if args.double:
             input = input.double()
 
+
+
         # compute output
         with torch.no_grad():
+            if i==0 and not table is None:          
+                ##import pdb; pdb.set_trace()  
+                all_eigs = model.fwd_rb_mode_log_eigens(input)
+                for l, eigvals in enumerate(all_eigs):
+                    ##table.add_data(epoch, l , eigvals)
+                    for eig in eigvals:
+                        table.add_data(epoch, l , eig)
+
+                wandb.log({"eigenvalues": table})
+                
             output = model(input)
             loss =F.cross_entropy(output, target, reduction  = 'mean')
             pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
-
         test_loss += loss.item()
 
         total += input.size(0)
         # if i % args.print_freq_test == 0:
         #     print('Test Loss: %.3f' % (test_loss / (i + 1)))
 
+
+
     test_acc = (100. * correct / len(test_loader.dataset))
     test_loss = test_loss/(i+1)
 
-    if writer is not None:
-        writer.add_scalar('test/loss', test_loss, epoch)
-        writer.add_scalar('test/acc', test_acc, epoch)
+    wandb.log( {"Test Loss": test_loss,
+                "Test Accuracy": test_acc})
 
+    
 
     return test_loss, test_acc
 

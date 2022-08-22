@@ -6,6 +6,7 @@ Reference:
 '''
 import torch
 import torch.nn as nn
+import wandb
 
 import math
 from collections import OrderedDict
@@ -534,7 +535,7 @@ class PlainFC(nn.Module):
 
 
 
-    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True, sparsity = 0.0):
+    def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True, sparsity = 0.0, binary = False):
 
         tot_norm = 0
         epsilon = 1
@@ -588,7 +589,12 @@ class PlainFC(nn.Module):
 
                     if resample:
 
-                        vb = torch.randn([batch_size,W.shape[0]],device =device, dtype = dtype) *epsilon 
+
+                        if binary:
+                            vb = (torch.randint(0,2,[batch_size,W.shape[0]],device =device, dtype = dtype) *2 -1) *epsilon 
+                        else:
+                            vb = torch.randn([batch_size,W.shape[0]],device =device, dtype = dtype) *epsilon 
+
                         if False and sparsity > 0.0:
                             vnmask = (torch.rand(vb.shape,device =device, dtype = dtype) >= sparsity).to(torch.float)
                             vb = vb*vnmask
@@ -605,9 +611,12 @@ class PlainFC(nn.Module):
                         else:
                             vw = torch.matmul(vb.unsqueeze(2),x.unsqueeze(1))
 
-
                     else:
-                        vn = torch.randn([W.shape[0],1],device =device, dtype = dtype) *epsilon 
+                        if binary:
+                            vn = (torch.randint(0,2,[W.shape[0],1],device =device, dtype = dtype) *2 -1) *epsilon 
+                        else:
+                            vn = torch.randn([W.shape[0],1],device =device, dtype = dtype) *epsilon 
+
                         if sparsity > 0.0:
                             vnmask = (torch.rand(vn.shape,device =device, dtype = dtype) >= sparsity).to(torch.float)
                             vn = vn*vnmask
@@ -627,7 +636,7 @@ class PlainFC(nn.Module):
 
                 else:
                     vb = torch.randn(B.shape,device =device, dtype = dtype) *epsilon
-                    vw = torch.randn(W.shape,device =device) *epsilon
+                    vw = torch.randn(W.shape,device =device) *epsilon 
                     new_grad = F.linear(x, vw) + vb  ## B x 1 X N1
 
                 if not old_grad is None:
@@ -719,4 +728,200 @@ class PlainFC(nn.Module):
 
 
         return x
+
+
+
+
+    def fwd_rb_mode(self,x, y, loss , transform = True, inv = "pinv"):
+
+
+        tot_norm = 0
+        eps = 1E-6
+        batch_size = x.shape[0]
+        old_grad = None
+        delta = 1
+
+        device =x.device
+        dtype = x.dtype
+
+
+
+        with torch.no_grad():
+            assert(self.actstr == "relu")
+            src_shape = x.shape
+            x = x.view(src_shape[0],-1) 
+            g = torch.randn_like(x).unsqueeze(2)
+
+            V = {}
+
+
+            J= torch.eye(x.shape[1],device = device).unsqueeze(0)
+
+
+            for i,linop in enumerate(self.linops):
+
+                W = linop.weight
+                B = linop.bias
+
+                x_pre = linop(x)
+                if i < len(self.linops) - 1:
+                    mask  =  ((x_pre >= 0).to(torch.float))
+                    x_post = self.act(x_pre)
+                    T = (W.t().unsqueeze(0)*mask.unsqueeze(1))
+                else:
+                    x_post = x_pre
+                    T = (W.t().unsqueeze(0))
+
+
+
+                ##import pdb; pdb.set_trace()
+
+                if inv == "pinv":
+                    J_cur = torch.linalg.pinv(T)
+                    g = J_cur @ g
+                    J = J_cur @ J 
+
+                    
+                elif inv == "lstsq":
+                    T = T.cpu()
+                    g = torch.linalg.lstsq(T,g.cpu(), driver = "gelsd").solution.to(device = device)
+                    J = torch.linalg.lstsq(T,J.cpu(), driver = "gelsd").solution.to(device = device)
+                else:
+                    raise ValueError(inv)
+                vb = g
+
+                z = x/(x.norm(dim=1,keepdim = True)+ eps)  ## B X N
+                vw = torch.matmul(vb,z.unsqueeze(1))   ##   B X M X 1    mm    B X 1 X N
+                new_grad = (torch.matmul(vw, x.unsqueeze(2)) + vb).squeeze()   ## B x N1
+
+                if not old_grad is None:
+                    old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
+                else:
+                    old_grad = 0
+                old_grad = old_grad + new_grad
+
+                if i < len(self.linops) - 1:
+                    old_grad = old_grad * mask ## B X N1
+                    maskd3 = mask.unsqueeze(2).expand(vw.shape)
+                    vw = vw * maskd3
+
+                x = x_post
+
+
+                if transform:
+                    if inv == "pinv":
+                        U = torch.linalg.pinv(J @ J.permute(0,2,1))
+                        vw = U @ vw 
+                        vb = U @ vb 
+                    elif inv == "lstsq":
+                        UU = (J @ J.permute(0,2,1)).cpu()
+                        vw = torch.linalg.lstsq(UU, vw.cpu(), driver = "gelsd").solution.to(device = device)
+                        vb = torch.linalg.lstsq(UU, vb.cpu(), driver = "gelsd").solution.to(device = device)
+
+                V[i] = (vw.clone(), vb.clone())
+
+                
+        dLdout = torch.zeros_like(x)
+        
+        out =torch.autograd.Variable(x, requires_grad = True)
+        out.grad = torch.zeros_like(out)
+        L = loss(out, y)
+
+        L.backward()
+        dLdout = out.grad
+        ##import pdb; pdb.set_trace()
+
+        dFg = (dLdout*old_grad).sum(1, keepdim = True)
+
+        for i in range(len(self.linops)):
+
+            linop = self.linops[i]
+            if linop.weight.grad is None:
+                linop.weight.grad = torch.zeros_like(linop.weight)
+                if not linop.bias is None:
+                    linop.bias.grad = torch.zeros_like(linop.bias)
+
+            vw, vb = V[i]
+            linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.reshape(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2])    ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
+            
+            if not linop.bias is None:
+                linop.bias.grad += torch.matmul(dFg.permute(1,0), vb.reshape(vw.shape[0],-1)).view(vb.shape[1])
+
+
+
+        return x
+
+    def fwd_rb_mode_log_eigens(self,x):
+
+
+        tot_norm = 0
+        eps = 1E-6
+        batch_size = x.shape[0]
+        old_grad = None
+        delta = 1
+
+        device =x.device
+        dtype = x.dtype
+
+        all_eigs = []
+
+        with torch.no_grad():
+            assert(self.actstr == "relu")
+            src_shape = x.shape
+            x = x.view(src_shape[0],-1) 
+            g = torch.randn_like(x).unsqueeze(2)
+
+            V = {}
+
+
+            J= torch.eye(x.shape[1],device = device).unsqueeze(0)
+
+
+            for i,linop in enumerate(self.linops):
+
+                W = linop.weight
+                B = linop.bias
+
+                x_pre = linop(x)
+                if i < len(self.linops) - 1:
+                    mask  =  ((x_pre >= 0).to(torch.float))
+                    x_post = self.act(x_pre)
+                    T = (W.t().unsqueeze(0)*mask.unsqueeze(1))
+                else:
+                    x_post = x_pre
+                    T = (W.t().unsqueeze(0))
+
+
+                J_cur = torch.linalg.pinv(T)
+                g = J_cur @ g
+                J = J_cur @ J 
+
+                _, eigs, _ = torch.linalg.svd(J)
+
+                
+                all_eigs.append(eigs.view(-1).tolist())
+
+                vb = g
+
+                z = x/(x.norm(dim=1,keepdim = True)+ eps)  ## B X N
+                vw = torch.matmul(vb,z.unsqueeze(1))   ##   B X M X 1    mm    B X 1 X N
+                new_grad = (torch.matmul(vw, x.unsqueeze(2)) + vb).squeeze()   ## B x N1
+
+                if not old_grad is None:
+                    old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
+                else:
+                    old_grad = 0
+                old_grad = old_grad + new_grad
+
+                if i < len(self.linops) - 1:
+                    old_grad = old_grad * mask ## B X N1
+                    maskd3 = mask.unsqueeze(2).expand(vw.shape)
+                    vw = vw * maskd3
+
+                x = x_post
+
+
+
+
+        return all_eigs
 
