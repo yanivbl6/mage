@@ -606,8 +606,13 @@ class PlainFC(nn.Module):
                             vb = vb*vnmask
 
                         if normalize_v:
-                            z = x/(x.norm(dim=1,keepdim = True)+ eps)  ## B X N
+
+                            mnorm = torch.sqrt(x.norm(dim=1,keepdim = True)**2+ 1 +  eps) 
+
+                            z = x/mnorm  ## B X N
                             vw = torch.matmul(vb.unsqueeze(2),z.unsqueeze(1))   ##   B X M X 1    mm    B X 1 X N
+                            vb = vb / mnorm
+                            
                         else:
                             vw = torch.matmul(vb.unsqueeze(2),x.unsqueeze(1))
 
@@ -624,8 +629,12 @@ class PlainFC(nn.Module):
                         vb = vn.clone().squeeze().expand(B.shape)
 
                         if normalize_v:
-                            z = x/(x.norm(dim=1,keepdim = True)+ eps)
+                            mnorm = torch.sqrt(x.norm(dim=1,keepdim = True)**2+ 1 +  eps) 
+                            z = x/mnorm  ## B X N
                             vw = torch.matmul(vn,z.unsqueeze(1))
+                            vb = vb / mnorm
+
+
                         else:
                             vw = torch.matmul(vn,x.unsqueeze(1))
 
@@ -715,7 +724,7 @@ class PlainFC(nn.Module):
             if not per_batch and mage:
                 linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2]) * (delta**K)   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
                 if not linop.bias is None:
-                    if resample:
+                    if True or resample:
                         linop.bias.grad +=  (dFg* vb).sum(0) * (delta**K)
                     else:
                         linop.bias.grad +=dFg.sum() * vb * (delta**K) 
