@@ -263,6 +263,15 @@ def get_model(args):
     # Data loading code
 
     wandb.init(project="mage-fc", entity="dl-projects" )
+
+    if args.mage and args.fwd_mode:
+        mode = "mage"
+    elif args.fwd_mode:
+        mode = "fwd"
+    else:
+        mode = "backprop"
+    args.mode =mode
+
     wandb.config.update(args)
 
 
