@@ -16,6 +16,48 @@ import numpy as np
 def str2act(txt, param= None):
     return {"sigmoid": nn.Sigmoid(), "relu": nn.ReLU(), "none": nn.Sequential() , "lrelu": nn.LeakyReLU(param), "selu": nn.SELU() }[txt.lower()]
 
+def decompose(z, alpha):
+    device = z.device
+
+    znorm2 = (z.norm(dim=2, keepdim = True))**2
+    ##znorm2 = torch.ones([1,1,1], device = device)
+
+
+    factor = torch.sqrt(alpha**2+ (1-alpha**2)* (znorm2))  - alpha
+    factor = factor/ znorm2
+    L =  alpha*torch.eye(z.size(2), device = device).unsqueeze(0) + factor * (z.permute(0,2,1) @ z)
+    return L
+
+
+def batched_sherman_morrison(guess,t, alpha):
+    z = guess[t].unsqueeze(1)
+    z = z / z.norm(dim=2, keepdim = True)
+    device = z.device
+    I = torch.eye(z.shape[2], device = device).unsqueeze(0)
+
+    if alpha == 0.0:
+        return I
+
+    factor = (1-alpha**2)/(alpha**2)
+    den = 1 + factor* torch.matmul(z,z.permute(0,2,1))
+    sol = I - factor* torch.matmul(z.permute(0,2,1),z)/den
+    return sol/alpha**2
+
+
+def batched_sherman_morrison2(z, alpha):
+    device = z.device
+    I = torch.eye(z.shape[2], device = device).unsqueeze(0)
+    S1 = I
+    S2 = (I - torch.matmul(z.permute(0,2,1),z)) *(1-alpha**2)/(alpha**2)
+
+    return S1, S2
+
+def projections(z):
+    device = z.device
+    I = torch.eye(z.shape[2], device = device).unsqueeze(0)
+    gg = (torch.matmul(z.permute(0,2,1),z))
+    I_gg = I - gg
+    return gg, I_gg
 
 
 class Flatten(torch.nn.Module):
@@ -432,15 +474,28 @@ class PlainFC(nn.Module):
 
     def forward(self, x):
         
+        self.guess_i = []
+        def hook_fn_i(grad):
+            self.guess_i.append(grad.clone().detach())
+            return None
+
+        self.anorm_tot = 0
 
         src_shape = x.shape
         x = x.view(src_shape[0],-1) 
 
         for i,linop in enumerate(self.linops):
+            self.anorm_tot = self.anorm_tot + x.norm(dim=1,keepdim = True)**2 + 1
             x = linop(x)
+
+            x = x.requires_grad_(True)
+            ##x = torch.tensor(x, requires_grad = True)
+            x.register_hook(hook_fn_i)
 
             if i < len(self.linops) - 1:
                 x = self.act(x)
+
+        self.anorm_tot = torch.sqrt(self.anorm_tot)
 
         return x
 
@@ -533,8 +588,6 @@ class PlainFC(nn.Module):
 
         return x,x2,V 
 
-
-
     def fwd_mode(self,x, y, loss , mage = False, epsilon=1e-5, per_batch = False, normalize_v = False, replicates = 0, resample = True, sparsity = 0.0, binary = False):
 
         tot_norm = 0
@@ -546,8 +599,6 @@ class PlainFC(nn.Module):
 
         device =x.device
         dtype = x.dtype
-
-
 
         with torch.no_grad():
             assert(self.actstr == "relu")
@@ -737,9 +788,6 @@ class PlainFC(nn.Module):
 
 
         return x
-
-
-
 
     def fwd_rb_mode(self,x, y, loss , transform = True, inv = "pinv"):
 
@@ -933,4 +981,166 @@ class PlainFC(nn.Module):
 
 
         return all_eigs
+
+    def fwd_mode_IG(self,x, y, loss, guess , ig = 1.0  ,   binary = False, anorm = None, gnorm = None, compensateV = None):
+
+        mage = True
+        tot_norm = 0
+        epsilon = 1
+        eps = 1E-6
+        batch_size = x.shape[0]
+        old_grad = None
+        delta = 1
+
+        device =x.device
+        dtype = x.dtype
+
+        with torch.no_grad():
+            assert(self.actstr == "relu")
+            src_shape = x.shape
+            x = x.view(src_shape[0],-1) 
+            V = {}
+            Vsrc = {}
+            for i,linop in enumerate(self.linops):
+                W = linop.weight
+                B = linop.bias
+
+                g = guess[i].unsqueeze(1)
+                if gnorm is None:
+                    g = g / g.norm(dim=2, keepdim = True)
+                else:
+                    g = g / gnorm
+
+                if compensateV is None:
+
+                    if ig > 0.0:
+                        L = decompose(g,ig)
+                        v = torch.randn([L.shape[0],L.shape[1],1], device=device)
+                        vn = L @ v
+                    else:
+                        vn = guess[i].unsqueeze(2)
+
+
+                    vb = vn.clone().squeeze()
+
+                    if anorm is None:
+                        mnorm = torch.sqrt(x.norm(dim=1,keepdim = True)**2+ 1 +  eps) 
+                    else:
+                        mnorm = anorm
+
+
+                    z = x/mnorm  ## B X N
+                    vw = torch.matmul(vn,z.unsqueeze(1))
+                    vb = vb / mnorm
+                    Vsrc[i] = (vw.clone(), vb.clone())
+                else:
+                    vw_c, vb_c = compensateV[i]
+                    gg, _ = projections(g)
+                    vb = (gg @ vb_c.unsqueeze(2)).squeeze(2)
+                    vw = gg @ vw_c
+
+
+                new_grad = torch.matmul(vw, x.unsqueeze(2)).squeeze() + vb   ## B x N1
+
+
+                if not old_grad is None:
+                    old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
+                else:
+                    old_grad = 0
+
+                old_grad = old_grad * delta + new_grad
+
+                if compensateV is None:
+                    S1, S2 = batched_sherman_morrison2(g, ig) ## < --- the issue is here
+                    vb = vb + (S2 @ vb.unsqueeze(2)).squeeze(2)
+                    vw = vw + S2 @ vw
+
+                    # transform = batched_sherman_morrison(guess, i, ig) ## < --- the issue is here
+                    # vb = (transform @ vb.unsqueeze(2)).squeeze(2)
+                    # vw = transform @ vw
+
+                    # breakpoint()
+                    # Sigma = L @ L.permute(0,2,1)
+                    # diff = (((S1 + S2) @ Sigma  - torch.eye(Sigma.shape[1], device = device))**2).mean()
+                    # print("diff: %.2E, S1.mean(): %.2E, S2.mean(): %.2E" % (diff, S1.mean(), S2.mean()))
+
+                    V[i] = (vw, vb)
+
+
+
+
+                x = linop(x)
+                if i < len(self.linops) - 1:
+                    mask  =  ((x >= 0).to(torch.float))
+                    old_grad = old_grad * mask ## B X N1
+                    x = self.act(x)
+                
+        dLdout = torch.zeros_like(x)
+        
+        out =torch.autograd.Variable(x, requires_grad = True)
+        out.grad = torch.zeros_like(out)
+        L = loss(out, y)
+
+
+        L.backward()
+        dLdout = out.grad
+        dFg = (dLdout*old_grad).sum(1, keepdim = True)
+
+        for i in range(len(self.linops)):
+
+            linop = self.linops[i]
+            if linop.weight.grad is None:
+                linop.weight.grad = torch.zeros_like(linop.weight)
+                if not linop.bias is None:
+                    linop.bias.grad = torch.zeros_like(linop.bias)
+
+
+            if compensateV is None:
+                vw, vb = V[i]
+            else:
+                vw, vb = compensateV[i]
+
+                g = guess[i].unsqueeze(1)
+                if gnorm is None:
+                    g = g / g.norm(dim=2, keepdim = True)
+                else:
+                    g = g / gnorm
+
+                _, I_gg = projections(g)
+                factor = -(1-ig**2)/ig**2
+
+                vb = (I_gg @ vb.unsqueeze(2)).squeeze(2) * factor
+                vw = (I_gg @ vw ) * factor                
+
+
+
+            linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2])   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
+            if not linop.bias is None:
+                if True or resample:
+                    linop.bias.grad += (dFg* vb).sum(0) 
+                else:
+                    linop.bias.grad += dFg.sum() * vb 
+
+
+        return x, Vsrc, dFg
+
+
+    def pop_guess(self):
+
+        # gnorm = self.get_tot_norms()
+        # anorm = self.anorm_tot
+
+        out = self.guess_i
+        self.guess_i = []
+        out.reverse()
+        return out, None, None
+
+
+
+    def get_tot_norms(self):
+        gnorm_tot = 0
+        for g in self.guess_i:
+            gnorm_tot = gnorm_tot + (g.unsqueeze(1).norm(dim=2, keepdim = True))**2
+
+        return torch.sqrt(gnorm_tot)
 
