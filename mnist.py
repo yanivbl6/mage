@@ -151,10 +151,14 @@ parser.add_argument('--compensate', action='store_true', default=False, help='co
 
 parser.add_argument('--log-eigens', action='store_true', default=False, help='log eigenvalues for J')
 
+parser.add_argument('--ig', action='store_true', default=False, help='Initial Guess mode')
 
-parser.add_argument('--ig', default=-1.0, type=float, help='Initial Guess mode')
+parser.add_argument('--ndirections-orth', default=1, type=int, help='number of random directions to average on, on the orthognal direction')
 
 
+parser.add_argument('--ig-noise', default=0.0, type=float, help='noise to add ig guess')
+
+parser.add_argument('--experiment', default="none", type=str, help='for wandb logging')
 
 parser.set_defaults(augment=True)
 
@@ -270,8 +274,8 @@ def get_model(args):
     wandb.init(project="mage-fc", entity="dl-projects" )
 
     if args.mage and args.fwd_mode:
-        if args.ig >= 0.0:
-            mode = "ig-mage"
+        if args.ig:
+            mode = "ig-mageV2"
         else:
             mode = "mage"
     elif args.fwd_mode:
@@ -428,7 +432,7 @@ def main():
 
 
         if args.fwd_mode:
-            if args.ig >= 0.0:
+            if args.ig:
                 train_loss, train_acc = train_ig(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
             else:
                 train_loss, train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
@@ -855,6 +859,7 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
     mloss = torch.nn.CrossEntropyLoss(reduction  = 'mean')
 
     Cs = np.zeros(len(model.linops)*2)
+    mags= np.zeros(2)
 
     for i, (input, target) in tqdm(enumerate(train_loader), total = len(train_loader)):
         optimizer.zero_grad()
@@ -869,7 +874,19 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
         loss =F.cross_entropy(output, target, reduction  = 'mean')
         loss.backward()
 
+        
+        
+        
         guess, anorm, gnorm = model.pop_guess()
+
+        if args.ig_noise > 0.0:
+            for guess_idx in range(len(guess)):
+                noise = torch.randn_like(guess[guess_idx])
+                noise = noise/ torch.sqrt((noise**2).mean(1, keepdim = True))
+                noise = noise * args.ig_noise * torch.sqrt((guess[guess_idx]**2).mean(1, keepdim = True))
+                guess[guess_idx] = guess[guess_idx] + noise
+
+
         anorm = None
         gnorm = None
         # breakpoint()
@@ -887,23 +904,29 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
 
         optimizer.zero_grad()
 
+        # for _ in range(args.ndirections):
+        #     out, V, dFg = model.fwd_mode_IG(input, target, lambda x,y: mloss(x,y)/args.ndirections, guess = guess, 
+        #                                     ig = args.ig, anorm = anorm, gnorm = gnorm, binary = binary)
+
+        #     if args.compensate:
+        #         out, V, dFg = model.fwd_mode_IG(input, target, lambda x,y: mloss(x,y)/args.ndirections, guess = guess, 
+        #                                         ig = args.ig, anorm = anorm, gnorm = gnorm, binary = binary, compensateV = V)
+
+
         for _ in range(args.ndirections):
-            out, V, dFg = model.fwd_mode_IG(input, target, lambda x,y: mloss(x,y)/args.ndirections, guess = guess, 
-                                            ig = args.ig, anorm = anorm, gnorm = gnorm, binary = binary)
 
-            # print("-"*64)
-            # for n, p in model.named_parameters():
-            #     print(f"{n}: {p.grad.norm()}")
-                
-            if args.compensate:
-                out, V, dFg = model.fwd_mode_IG(input, target, lambda x,y: mloss(x,y)/args.ndirections, guess = guess, 
-                                                ig = args.ig, anorm = anorm, gnorm = gnorm, binary = binary, compensateV = V)
+            out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/args.ndirections, 
+                                            guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = True)
+            mags[0] = mags[0] + dFg.abs().mean().item()
 
-            # print("-"*64)
-            # for n, p in model.named_parameters():
-            #     print(f"{n}: {p.grad.norm()}")
 
-            # breakpoint()
+
+        for _ in range(args.ndirections_orth):
+            out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/args.ndirections_orth, 
+                                            guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = False)
+
+            mags[1] = mags[1] + dFg.abs().mean().item()
+
 
 
 
@@ -925,9 +948,12 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
 
-
     print(Cs/i)
-    
+
+    print(mags[0]/(i*args.ndirections))
+    print(mags[1]/(i*args.ndirections_orth))
+    # print(np.sqrt(mags[0]/(i*args.ndirections)))
+    # print(np.sqrt(mags[1]/(i*args.ndirections_orth)))
     wandb.log({"Epoch": epoch,
                 "Train Loss": train_loss,
                 "Train Acc": train_acc,

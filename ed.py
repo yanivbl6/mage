@@ -982,7 +982,7 @@ class PlainFC(nn.Module):
 
         return all_eigs
 
-    def fwd_mode_IG(self,x, y, loss, guess , ig = 1.0  ,   binary = False, anorm = None, gnorm = None, compensateV = None):
+    def fwd_mode_IG(self,x, y, loss, guess , ig = 1.0  ,   binary = False, anorm = None, gnorm = None, compensateV = None, parallel = True):
 
         mage = True
         tot_norm = 0
@@ -1066,9 +1066,6 @@ class PlainFC(nn.Module):
 
                     V[i] = (vw, vb)
 
-
-
-
                 x = linop(x)
                 if i < len(self.linops) - 1:
                     mask  =  ((x >= 0).to(torch.float))
@@ -1124,6 +1121,112 @@ class PlainFC(nn.Module):
 
         return x, Vsrc, dFg
 
+
+    def fwd_mode_IG2(self,x, y, loss, guess , binary = False, anorm = None, gnorm = None, parallel = True):
+
+        mage = True
+        tot_norm = 0
+        epsilon = 1
+        eps = 1E-6
+        batch_size = x.shape[0]
+        old_grad = None
+
+        device =x.device
+        dtype = x.dtype
+
+        with torch.no_grad():
+            assert(self.actstr == "relu")
+            src_shape = x.shape
+            x = x.view(src_shape[0],-1) 
+            V = {}
+            for i,linop in enumerate(self.linops):
+                W = linop.weight
+                B = linop.bias
+
+                g = guess[i].unsqueeze(1)
+
+                if gnorm is None:
+                    g = g / g.norm(dim=2, keepdim = True)
+                else:
+                    g = g / gnorm
+
+
+                # vn = torch.randn([W.shape[0],1],device =device, dtype = dtype).expand(W.shape[0], batch_size)
+                # vb = vn.clone().squeeze().permute(1,0)
+
+                vn = torch.randn([batch_size, W.shape[0], 1],device =device, dtype = dtype)
+                vb = vn.clone().squeeze(2)
+
+                if anorm is None:
+                    mnorm = torch.sqrt(x.norm(dim=1,keepdim = True)**2 + 1 +  eps) 
+                else:
+                    mnorm = anorm
+
+                z = x/mnorm  ## B X N
+
+                vw = torch.matmul(vn,z.unsqueeze(1))
+                vb = vb / mnorm
+
+                if parallel:
+                    gg, _ = projections(g)
+                    vb = (gg @ vb.unsqueeze(2)).squeeze(2)
+                    vw = gg @ vw
+                else:
+                    _, I_gg = projections(g)
+                    vb = (I_gg @ vb.unsqueeze(2)).squeeze(2)
+                    vw = I_gg @ vw
+
+
+
+                V[i] = (vw.clone(), vb.clone())
+
+
+                new_grad = torch.matmul(vw, x.unsqueeze(2)).squeeze() + vb   ## B x N1
+
+
+                if not old_grad is None:
+                    old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
+                else:
+                    old_grad = 0
+
+                old_grad = old_grad + new_grad
+
+                x = linop(x)
+                if i < len(self.linops) - 1:
+                    mask  =  ((x >= 0).to(torch.float))
+                    old_grad = old_grad * mask ## B X N1
+                    x = self.act(x)
+                
+        dLdout = torch.zeros_like(x)
+        
+        out =torch.autograd.Variable(x, requires_grad = True)
+        out.grad = torch.zeros_like(out)
+        L = loss(out, y)
+
+
+        L.backward()
+        dLdout = out.grad
+        dFg = (dLdout*old_grad).sum(1, keepdim = True)
+
+        for i in range(len(self.linops)):
+
+            linop = self.linops[i]
+            if linop.weight.grad is None:
+                linop.weight.grad = torch.zeros_like(linop.weight)
+                if not linop.bias is None:
+                    linop.bias.grad = torch.zeros_like(linop.bias)
+
+
+            vw, vb = V[i]
+
+            linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2])   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
+            if not linop.bias is None:
+                if True or resample:
+                    linop.bias.grad += (dFg* vb).sum(0) 
+                else:
+                    linop.bias.grad += dFg.sum() * vb 
+
+        return x, dFg
 
     def pop_guess(self):
 
