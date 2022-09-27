@@ -884,6 +884,7 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
                 noise = torch.randn_like(guess[guess_idx])
                 noise = noise/ torch.sqrt((noise**2).mean(1, keepdim = True))
                 noise = noise * args.ig_noise * torch.sqrt((guess[guess_idx]**2).mean(1, keepdim = True))
+                noise = noise.abs() ## for bias
                 guess[guess_idx] = guess[guess_idx] + noise
 
 
