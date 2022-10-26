@@ -475,14 +475,23 @@ class PlainFC(nn.Module):
     def forward(self, x):
         
         self.guess_i = []
+        self.guess_x = None
+
         def hook_fn_i(grad):
             self.guess_i.append(grad.clone().detach())
+            return None
+
+        def hook_fn_x(grad):
+            self.guess_x = grad.clone().detach()
             return None
 
         self.anorm_tot = 0
 
         src_shape = x.shape
         x = x.view(src_shape[0],-1) 
+        x = x.requires_grad_(True)
+
+        x.register_hook(hook_fn_x)
 
         for i,linop in enumerate(self.linops):
             self.anorm_tot = self.anorm_tot + x.norm(dim=1,keepdim = True)**2 + 1
@@ -601,7 +610,7 @@ class PlainFC(nn.Module):
         dtype = x.dtype
 
         with torch.no_grad():
-            assert(self.actstr == "relu")
+            assert(self.actstr == "relu" or self.actstr == "lrelu")
             src_shape = x.shape
             x = x.view(src_shape[0],-1) 
             V = {}
@@ -715,6 +724,8 @@ class PlainFC(nn.Module):
 
                 if i < len(self.linops) - 1:
                     mask  =  ((x >= 0).to(torch.float))
+                    if self.actstr == "lrelu":
+                        mask = mask + (1-mask)*self.lamb
 
                     old_grad = old_grad * mask ## B X N1
                     if not mage:
@@ -837,8 +848,6 @@ class PlainFC(nn.Module):
                     J_cur = torch.linalg.pinv(T)
                     g = J_cur @ g
                     J = J_cur @ J 
-
-                    
                 elif inv == "lstsq":
                     T = T.cpu()
                     g = torch.linalg.lstsq(T,g.cpu(), driver = "gelsd").solution.to(device = device)
@@ -1122,7 +1131,7 @@ class PlainFC(nn.Module):
         return x, Vsrc, dFg
 
 
-    def fwd_mode_IG2(self,x, y, loss, guess , binary = False, anorm = None, gnorm = None, parallel = True):
+    def fwd_mode_IG2(self,x, y, loss, guess , binary = False, anorm = None, gnorm = None, parallel = True, fake = False):
 
         mage = True
         tot_norm = 0
@@ -1135,7 +1144,7 @@ class PlainFC(nn.Module):
         dtype = x.dtype
 
         with torch.no_grad():
-            assert(self.actstr == "relu")
+            assert(self.actstr == "relu" or self.actstr == "lrelu" )
             src_shape = x.shape
             x = x.view(src_shape[0],-1) 
             V = {}
@@ -1176,6 +1185,10 @@ class PlainFC(nn.Module):
                     vb = (I_gg @ vb.unsqueeze(2)).squeeze(2)
                     vw = I_gg @ vw
 
+                if fake:
+                    vw = torch.matmul(g.permute(0,2,1),z.unsqueeze(1))
+                    vb = (g.squeeze(1))/mnorm
+
 
 
                 V[i] = (vw.clone(), vb.clone())
@@ -1194,9 +1207,134 @@ class PlainFC(nn.Module):
                 x = linop(x)
                 if i < len(self.linops) - 1:
                     mask  =  ((x >= 0).to(torch.float))
+
+                    if self.actstr == "lrelu":
+                        mask = mask + (1-mask)*self.lamb
+
                     old_grad = old_grad * mask ## B X N1
                     x = self.act(x)
                 
+        dLdout = torch.zeros_like(x)
+        
+        out =torch.autograd.Variable(x, requires_grad = True)
+        out.grad = torch.zeros_like(out)
+        L = loss(out, y)
+
+
+        L.backward()
+        dLdout = out.grad
+        dFg = (dLdout*old_grad).sum(1, keepdim = True)
+
+        for i in range(len(self.linops)):
+
+            linop = self.linops[i]
+            if linop.weight.grad is None:
+                linop.weight.grad = torch.zeros_like(linop.weight)
+                if not linop.bias is None:
+                    linop.bias.grad = torch.zeros_like(linop.bias)
+
+
+            vw, vb = V[i]
+
+            linop.weight.grad +=  torch.matmul(dFg.permute(1,0), vw.view(vw.shape[0],-1)).view(vw.shape[1],vw.shape[2])   ## 1 x B   mm   Bx(N1xN2)  >   N1 x N2
+            if not linop.bias is None:
+                if True or resample:
+                    linop.bias.grad += (dFg* vb).sum(0) 
+                else:
+                    linop.bias.grad += dFg.sum() * vb 
+
+        return x, dFg
+
+    def fwd_mode_IG_RB(self,x, y, loss, g , binary = False, parallel = True, inv = "pinv"):
+
+
+        
+
+        mage = True
+        tot_norm = 0
+        epsilon = 1
+        eps = 1E-6
+        batch_size = x.shape[0]
+        old_grad = None
+
+        device =x.device
+        dtype = x.dtype
+
+        with torch.no_grad():
+            assert(self.actstr == "relu" or self.actstr == "lrelu")
+            src_shape = x.shape
+            x = x.view(src_shape[0],-1) 
+            V = {}
+
+            g = g.unsqueeze(2)
+            J= torch.eye(x.shape[1],device = device).unsqueeze(0)
+
+            for i,linop in enumerate(self.linops):
+                W = linop.weight
+                B = linop.bias
+
+                x_pre = linop(x)
+                if i < len(self.linops) - 1:
+                    mask  =  ((x_pre >= 0).to(torch.float))
+                    x_post = self.act(x_pre)
+                    if self.actstr == "lrelu":
+                        mask = mask + (1-mask)*self.lamb
+                    T = (W.t().unsqueeze(0)*mask.unsqueeze(1))
+                else:
+                    x_post = x_pre
+                    T = (W.t().unsqueeze(0))
+
+                if inv == "pinv":
+                    J_cur = torch.linalg.pinv(T)
+                    g = J_cur @ g
+                    J = J_cur @ J 
+                elif inv == "lstsq":
+                    T = T.cpu()
+                    g = torch.linalg.lstsq(T,g.cpu(), driver = "gelsd").solution.to(device = device)
+                    J = torch.linalg.lstsq(T,J.cpu(), driver = "gelsd").solution.to(device = device)
+                else:
+                    raise ValueError(inv)
+
+
+                vn = torch.randn([batch_size, W.shape[0], 1],device =device, dtype = dtype)
+                vb = vn.clone().squeeze(2)
+
+                mnorm = torch.sqrt(x.norm(dim=1,keepdim = True)**2 + 1 +  eps) 
+                z = x/mnorm  ## B X N
+
+                vw = torch.matmul(vn,z.unsqueeze(1))
+                vb = vb / mnorm
+                
+                g_ = g.permute(0,2,1)
+                if parallel:
+                    gg, _ = projections( g_ / g_.norm(dim=2, keepdim = True))
+                    vb = (gg @ vb.unsqueeze(2)).squeeze(2)
+                    vw = gg @ vw
+                else:
+                    _, I_gg = projections( g_ / g_.norm(dim=2, keepdim = True))
+                    vb = (I_gg @ vb.unsqueeze(2)).squeeze(2)
+                    vw = I_gg @ vw
+
+                V[i] = (vw.clone(), vb.clone())
+
+                new_grad = torch.matmul(vw, x.unsqueeze(2)).squeeze() + vb   ## B x N1
+
+                if not old_grad is None:
+                    old_grad = torch.matmul(old_grad, linop.weight.permute(1,0)) ## B X N0  mm  N0 X N1 -> B X N1
+                else:
+                    old_grad = 0
+
+                old_grad = old_grad + new_grad
+
+                x = linop(x)                
+                if i < len(self.linops) - 1:
+                    old_grad = old_grad * mask ## B X N1
+                    maskd3 = mask.unsqueeze(2).expand(vw.shape)
+                    vw = vw * maskd3
+
+                x = x_post
+
+
         dLdout = torch.zeros_like(x)
         
         out =torch.autograd.Variable(x, requires_grad = True)
@@ -1238,6 +1376,10 @@ class PlainFC(nn.Module):
         out.reverse()
         return out, None, None
 
+    def pop_x(self):
+        out = self.guess_x
+        self.guess_x = None
+        return out
 
 
     def get_tot_norms(self):

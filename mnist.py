@@ -153,10 +153,18 @@ parser.add_argument('--log-eigens', action='store_true', default=False, help='lo
 
 parser.add_argument('--ig', action='store_true', default=False, help='Initial Guess mode')
 
+parser.add_argument('--misc', action='store_true', default=False, help='Dont log')
+
+parser.add_argument('--leaky', action='store_true', default=False, help='leaky relu')
+
+parser.add_argument('--fake', action='store_true', default=False, help='just use the guess')
+
+
 parser.add_argument('--ndirections-orth', default=1, type=int, help='number of random directions to average on, on the orthognal direction')
 
 
 parser.add_argument('--ig-noise', default=0.0, type=float, help='noise to add ig guess')
+parser.add_argument('--lamb', default=0.0, type=float, help='value for leaky relu')
 
 parser.add_argument('--experiment', default="none", type=str, help='for wandb logging')
 
@@ -270,21 +278,27 @@ def get_model(args):
     device = torch.device("cuda" if use_cuda else "cpu")
 
     # Data loading code
-
-    wandb.init(project="mage-fc", entity="dl-projects" )
+    if not args.misc:
+        wandb.init(project="mage-fc", entity="dl-projects" )
 
     if args.mage and args.fwd_mode:
-        if args.ig:
+
+        if args.rb:
+            mode = "reverse-BP"
+        elif args.ig:
             mode = "ig-mageV2"
         else:
             mode = "mage"
+
+
     elif args.fwd_mode:
         mode = "fwd"
     else:
         mode = "backprop"
     args.mode =mode
 
-    wandb.config.update(args)
+    if not args.misc:
+        wandb.config.update(args)
 
 
     print('==> Preparing data..')
@@ -334,7 +348,7 @@ def get_model(args):
     elif args.arch == "dbl-fc":
         model = dbl_FC(input_size, args.layers, (not args.single))
     elif args.arch == "fc":
-        model = PlainFC(input_size, args.layers, args.act, args.widening, lamb = 0.0, classes = n_classes, first_layer = args.first)
+        model = PlainFC(input_size, args.layers, args.act, args.widening, lamb = args.lamb, classes = n_classes, first_layer = args.first)
     else:
         raise ValueError("wrong arch: %f" % args.arch)
     # get the number of model parameters
@@ -426,14 +440,18 @@ def main():
 
     if args.log_eigens:
         all_eigs = []
-        table = wandb.Table(columns=["epoch","layer","eigs"])
+        if not args.misc:
+            table = wandb.Table(columns=["epoch","layer","eigs"])
     
     for epoch in range(args.start_epoch,args.epochs//args.epoch_scale):
 
 
         if args.fwd_mode:
             if args.ig:
-                train_loss, train_acc = train_ig(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
+                if args.rb:
+                    train_loss, train_acc = train_ig_rb(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
+                else:
+                    train_loss, train_acc = train_ig(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
             else:
                 train_loss, train_acc = train_fwd(dl_train, model, args , optimizer, scheduler, epoch*args.epoch_scale, device, writer, args.epsilon, args.mage, args.resample, args.sparsity, args.binary )
         elif args.finite_diff:
@@ -581,10 +599,11 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
     
-    wandb.log({"Epoch": epoch,
-                "Train Loss": train_loss,
-                "Train Acc": train_acc,
-                "Learning Rate: ": optimizer.param_groups[0]['lr']})
+    if not args.misc:
+        wandb.log({"Epoch": epoch,
+                    "Train Loss": train_loss,
+                    "Train Acc": train_acc,
+                    "Learning Rate: ": optimizer.param_groups[0]['lr']})
 
 
         # for i,linop in enumerate(model.linops) :
@@ -828,10 +847,11 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
 
-    wandb.log({"Epoch": epoch,
-                "Train Loss": train_loss,
-                "Train Acc": train_acc,
-                "Learning Rate: ": optimizer.param_groups[0]['lr']})
+    if not args.misc:
+        wandb.log({"Epoch": epoch,
+                    "Train Loss": train_loss,
+                    "Train Acc": train_acc,
+                    "Learning Rate: ": optimizer.param_groups[0]['lr']})
 
         # for i,linop in enumerate(model.linops) :
         #     if i == 0:
@@ -841,6 +861,82 @@ def train_fwd(train_loader, model, args, optimizer, scheduler, epoch, device, wr
         #     writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
         #     if not linop.bias is None:
         #         writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+
+    return train_loss, train_acc
+
+def train_ig_rb(train_loader, model, args, optimizer, scheduler, epoch, device, writer=None,epsilon = 1e-5, mage = False, resample = False, sparsity = 0.0,binary  =False):
+    """Train for one epoch on the training set"""
+    # switch to train mode
+    watcher = True
+    model.train()
+    print('\nEpoch: %d' % epoch)
+    train_loss = 0
+    total = 0
+    correct = 0
+    
+    mloss = torch.nn.CrossEntropyLoss(reduction  = 'mean')
+
+    Cs = np.zeros(len(model.linops)*2)
+    mags= np.zeros(2)
+
+    for i, (input, target) in tqdm(enumerate(train_loader), total = len(train_loader)):
+        optimizer.zero_grad()
+        batch_size = input.shape[0]
+        input = input.to(device)
+        target = target.to(device)
+
+        if args.double:
+            input = input.double()
+
+        output = model(input)
+        loss =F.cross_entropy(output, target, reduction  = 'mean')
+        loss.backward()
+
+        
+        
+        
+        guess_x = model.pop_x()
+
+        # breakpoint()
+
+        total += input.size(0)
+
+        pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        total += input.size(0)
+        train_loss += loss.item()
+
+        optimizer.zero_grad()
+
+        for _ in range(args.ndirections - args.ndirections_orth):
+            out, dFg = model.fwd_mode_IG_RB(input, target, lambda x,y: mloss(x,y)/(args.ndirections-args.ndirections_orth), 
+                                            g = guess_x, binary = binary, parallel = True)
+
+
+        if args.ndirections_orth>0:
+            for _ in range(args.ndirections_orth):
+                out, dFg = model.fwd_mode_IG_RB(input, target, lambda x,y: mloss(x,y)/args.ndirections_orth, 
+                                                g = guess_x, binary = binary, parallel = False)
+
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3)
+
+        optimizer.step()
+        scheduler.step()
+
+        if watcher and np.isnan(train_loss):
+            watcher = False
+            print(f"Turned Nan on step {i}")
+
+    train_acc = (100. * correct / len(train_loader.dataset))
+    train_loss = train_loss/total
+
+    if not args.misc:
+        wandb.log({"Epoch": epoch,
+                    "Train Loss": train_loss,
+                    "Train Acc": train_acc,
+                    "Learning Rate: ": optimizer.param_groups[0]['lr']})
+
 
     return train_loss, train_acc
 
@@ -914,19 +1010,20 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
         #                                         ig = args.ig, anorm = anorm, gnorm = gnorm, binary = binary, compensateV = V)
 
 
-        for _ in range(args.ndirections):
+        for _ in range(args.ndirections - args.ndirections_orth):
 
-            out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/args.ndirections, 
-                                            guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = True)
-            mags[0] = mags[0] + dFg.abs().mean().item()
+            out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/(args.ndirections - args.ndirections_orth), 
+                                            guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = True, fake = args.fake)
+            # mags[0] = mags[0] + dFg.abs().mean().item()
 
 
 
-        for _ in range(args.ndirections_orth):
-            out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/args.ndirections_orth, 
-                                            guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = False)
+        if args.ndirections_orth>0:
+            for _ in range(args.ndirections_orth):
+                out, dFg = model.fwd_mode_IG2(input, target, lambda x,y: mloss(x,y)/args.ndirections_orth, 
+                                                guess = guess, anorm = anorm, gnorm = gnorm, binary = binary, parallel = False)
 
-            mags[1] = mags[1] + dFg.abs().mean().item()
+                # mags[1] = mags[1] + dFg.abs().mean().item()
 
 
 
@@ -949,16 +1046,18 @@ def train_ig(train_loader, model, args, optimizer, scheduler, epoch, device, wri
     train_acc = (100. * correct / len(train_loader.dataset))
     train_loss = train_loss/total
 
-    print(Cs/i)
+    # print(Cs/i)
 
-    print(mags[0]/(i*args.ndirections))
-    print(mags[1]/(i*args.ndirections_orth))
+    # print(mags[0]/(i*args.ndirections))
+    # print(mags[1]/(i*args.ndirections_orth))
     # print(np.sqrt(mags[0]/(i*args.ndirections)))
     # print(np.sqrt(mags[1]/(i*args.ndirections_orth)))
-    wandb.log({"Epoch": epoch,
-                "Train Loss": train_loss,
-                "Train Acc": train_acc,
-                "Learning Rate: ": optimizer.param_groups[0]['lr']})
+
+    if not args.misc:
+        wandb.log({"Epoch": epoch,
+                    "Train Loss": train_loss,
+                    "Train Acc": train_acc,
+                    "Learning Rate: ": optimizer.param_groups[0]['lr']})
 
 
     return train_loss, train_acc
@@ -997,7 +1096,8 @@ def test(test_loader, model, args, device, epoch, table = None, writer=None):
                     for eig in eigvals:
                         table.add_data(epoch, l , eig)
 
-                wandb.log({"eigenvalues": table})
+                if not args.misc:
+                    wandb.log({"eigenvalues": table})
                 
             output = model(input)
             loss =F.cross_entropy(output, target, reduction  = 'mean')
@@ -1013,9 +1113,9 @@ def test(test_loader, model, args, device, epoch, table = None, writer=None):
 
     test_acc = (100. * correct / len(test_loader.dataset))
     test_loss = test_loss/(i+1)
-
-    wandb.log( {"Test Loss": test_loss,
-                "Test Accuracy": test_acc})
+    if not args.misc:
+        wandb.log( {"Test Loss": test_loss,
+                    "Test Accuracy": test_acc})
 
     
 
