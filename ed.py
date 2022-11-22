@@ -771,11 +771,12 @@ class Block0(nn.Module):
         return x
 
 class MLP_Block(nn.Module):
-    def __init__(self, in_features1, in_features2, in_features3, group, out_features):
+    def __init__(self, in_shape, G):
         super(MLP_Block, self).__init__()
-        self.linear1 = nn.Linear(in_features1, in_features2)
-        self.linear2 = nn.Linear(in_features2, in_features3)
-        self.group_linear = nn.Linear(in_features3 // group, out_features)
+        b, c, h, w = in_shape
+        self.linear1 = nn.Linear(h * w, h * w)
+        self.linear2 = nn.Linear(c, c)
+        self.group_linear = nn.Linear(c // G, c // G)
 
     def forward(self, x):
         N, P, G, _ = x.shape
@@ -797,15 +798,16 @@ class MLP_Block(nn.Module):
         x = normalize(x)
         x = self.group_linear(x)
         x = normalize(x)
+        # no reshaping?
         x = x + inputs
         x = torch.nn.relu(x)
         return x
 
 class LocalMixer(nn.Module):
-    def __init__(self, num_blocks):
+    def __init__(self, num_blocks=1, in_shape, G):
         super(LocalMixer, self).__init__()
         self.block0 = Block0()
-        self.blocks = torch.nn.ModuleList([MLP_Block() for _ in range(num_blocks)])
+        self.blocks = torch.nn.ModuleList([MLP_Block(in_shape, G) for _ in range(num_blocks)])
         self.linear = torch.nn.Linear()
 
     def forward(self, x):
