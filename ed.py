@@ -720,3 +720,108 @@ class PlainFC(nn.Module):
 
         return x
 
+
+def naive_avg_group_linear_xent(x, w, b, labels):
+    N, P, G, _ = x.shape
+    # Average pooling, with stop gradients. [N,P,G,C/G] -> [N,1,G,C/G]
+    avg_pool_p = torch.mean(x, dim=1, keepdim=True)
+    x_div_p = x / float(P)
+    # [N,P,G,C/G]
+    x = x_div_p + (avg_pool_p - x_div_p).detach()
+    # Concatenate everything, with stop gradients. [N,P,G,C] -> [N,P,G,G,C/G]
+    x = torch.tile(torch.reshape(x, [N, P, 1, G, -1]), [1, 1, G, 1, 1])
+    mask = torch.eye(G)[None, None, :, :, None]
+    x = mask * x + ((1.0 - mask) * x).detach()
+    # [N,P,G,G,C/G] -> [N,P,G,C]
+    x = torch.reshape(x, [N, P, G, -1])
+    logits = torch.einsum('npgc,cd->npgd', x, w) + b
+    logits = logits - torch.logsumexp(logits, axis=-1, keepdims=True)
+    loss = -torch.sum(logits * labels[:, None, None, :], axis=-1)
+    return loss
+
+def normalize(x, axis=-1, eps=1e-5):
+    """Normalization layer."""
+    mean = torch.mean(x, dim=axis, keepdim=True)
+    mean_of_squares = torch.mean(torch.square(x), dim=axis, keepdims=True)
+    var = mean_of_squares - torch.square(mean)
+    inv = (var + eps).sqrt()
+    y = (x - mean) * inv
+    return y
+
+class Block0(nn.Module):
+    def __init__(self, num_groups, in_features1, in_features2, out_features):
+        super(Block0, self).__init__()
+        self.num_groups = num_groups
+        self.linear1 = nn.Linear(in_features1, in_features2)
+        self.group_linear = nn.Linear(in_features2 // num_groups, out_features)
+
+
+    def forward(self, x):
+        N, P, _ = x.shape
+        G = self.num_groups
+        x = normalize(x)
+        x = self.linear1(x)
+        x = normalize(x)
+        x = torch.nn.relu(x)
+        x = torch.reshape(x, [N, P, G, -1])
+        x = normalize(x)
+        x = self.group_linear(x)
+        x = normalize(x)
+        x = torch.nn.relu(x)
+        return x
+
+class MLP_Block(nn.Module):
+    def __init__(self, in_features1, in_features2, in_features3, group, out_features):
+        super(MLP_Block, self).__init__()
+        self.linear1 = nn.Linear(in_features1, in_features2)
+        self.linear2 = nn.Linear(in_features2, in_features3)
+        self.group_linear = nn.Linear(in_features3 // group, out_features)
+
+    def forward(self, x):
+        N, P, G, _ = x.shape
+        inputs = x
+        # Token mixing.
+        x = torch.reshape(x, [N, P, -1])
+        x = normalize(x)
+        x = torch.swapaxes(x, 1, 2)
+        x = self.linear1(x)
+        x = torch.swapaxes(x, 1, 2)
+        x = normalize(x)
+        x = torch.nn.relu(x)
+        # Channel mixing.
+        x = normalize(x)
+        x = self.linear2(x)
+        x = normalize(x) # normalize_layer?
+        x = torch.nn.relu(x)
+        x = torch.reshape(x, [N, P, G, -1])
+        x = normalize(x)
+        x = self.group_linear(x)
+        x = normalize(x)
+        x = x + inputs
+        x = torch.nn.relu(x)
+        return x
+
+class LocalMixer(nn.Module):
+    def __init__(self, num_blocks):
+        super(LocalMixer, self).__init__()
+        self.block0 = Block0()
+        self.blocks = torch.nn.ModuleList([MLP_Block() for _ in range(num_blocks)])
+        self.linear = torch.nn.Linear()
+
+    def forward(self, x):
+        pred_local = []  # Local predictions.
+        # Build network blocks.
+        x = self.block0(x)
+        for blk, local_linear in zip(self.blocks, self.local_linears):
+            x = blk(x)
+            # Projector connects to local losses.
+            x_proj = normalize(x)
+            pred_local.append(local_linear(x_proj))
+            # Disconnect gradients.
+            x = x.detach()
+        x = torch.reshape(x, [x.shape[0], x.shape[1], -1])
+        x = torch.mean(x, dim=1)  # [N,C]
+        x = normalize(x)
+        pred = self.linear(x)
+        return pred, pred_local
+
