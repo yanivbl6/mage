@@ -118,7 +118,7 @@ parser.add_argument('--sigma', default=1.25, type=float, help='momentum')
 
 
 parser.add_argument('--epsilon', default=1e-5, type=float, help='epsilon for finite diff')
-parser.add_argument('--mage', action='store_true', default=False, help="Daniel's scheme")
+parser.add_argument('--mage', action='store_true', default=False, help="use MAGE")
 parser.add_argument('--per-batch', action='store_true', default=False, help="Calc V per batch")
 parser.add_argument('--finite-diff', action='store_true', default=False, help="use finite diff")
 parser.add_argument('--fwd-mode', action='store_true', default=False, help="use forward mode")
@@ -134,6 +134,7 @@ parser.add_argument('--double', action='store_true', default=False, help="double
 parser.add_argument('--replicates', default=0, type=int, help="replicates")
 
 parser.add_argument('--sparsity', default=0.0, type=float, help='deltas sparsity')
+parser.add_argument('--groups', default=8, type=int, help="number of groups for localMixer")
 
 
 parser.add_argument('--ndirections', default=1, type=int, help='number of random directions to average on')
@@ -303,6 +304,8 @@ def get_model(args):
         model = dbl_FC(input_size, args.layers, (not args.single))
     elif args.arch == "fc":
         model = PlainFC(input_size, args.layers, args.act, args.widening, lamb = 0.0, classes = n_classes, first_layer = args.first)
+    elif args.arch.lower() == "localmixer":
+        model = LocalMixer([1,input_size*input_size, input_channels], args.layers, args.groups, args.widening, lamb = 0.0, classes = n_classes, first_layer = args.first)
     else:
         raise ValueError("wrong arch: %f" % args.arch)
     # get the number of model parameters
@@ -545,16 +548,17 @@ def train(train_loader, model, args, optimizer, scheduler, epoch, device, writer
     if writer is not None:
         writer.add_scalar('train/loss', train_loss, epoch)
         writer.add_scalar('train/acc', train_acc, epoch)
-        for i,linop in enumerate(model.linops) :
-            if i == 0:
-                stri=""
-            else:
-                stri = f"{i}"
-            writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
-            if not linop.bias is None:
-                writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
+        if model.linops is not None:
+            for i,linop in enumerate(model.linops) :
+                if i == 0:
+                    stri=""
+                else:
+                    stri = f"{i}"
+                writer.add_scalar(f'L2norm/weight{stri}', linop.weight.norm().item(), epoch)
+                if not linop.bias is None:
+                    writer.add_scalar(f'L2norm/bias{stri}', linop.bias.norm().item(), epoch)
 
-        writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar('lr/scheduler', optimizer.param_groups[0]['lr'], epoch)
 
     return train_loss, train_acc
 

@@ -12,6 +12,9 @@ from collections import OrderedDict
 import torch.nn.functional as F
 
 import numpy as np
+
+from torch.autograd import Variable
+
 def str2act(txt, param= None):
     return {"sigmoid": nn.Sigmoid(), "relu": nn.ReLU(), "none": nn.Sequential() , "lrelu": nn.LeakyReLU(param), "selu": nn.SELU() }[txt.lower()]
 
@@ -748,35 +751,42 @@ def normalize(x, axis=-1, eps=1e-5):
     y = (x - mean) * inv
     return y
 
-class Block0(nn.Module):
-    def __init__(self, num_groups, in_features1, in_features2, out_features):
-        super(Block0, self).__init__()
-        self.num_groups = num_groups
-        self.linear1 = nn.Linear(in_features1, in_features2)
-        self.group_linear = nn.Linear(in_features2 // num_groups, out_features)
 
 
-    def forward(self, x):
-        N, P, _ = x.shape
-        G = self.num_groups
-        x = normalize(x)
-        x = self.linear1(x)
-        x = normalize(x)
-        x = torch.nn.relu(x)
-        x = torch.reshape(x, [N, P, G, -1])
-        x = normalize(x)
-        x = self.group_linear(x)
-        x = normalize(x)
-        x = torch.nn.relu(x)
-        return x
+
+
+
+def do_group_linear(x,  w, b):
+    "return jnp.einsum(’npgc,gcd->npgd’, x, w) + b"
+
+    "x  in [N,P,G,D], W in [D, D2]"
+
+    x = torch.einsum("npgc,gcd->npgd", x, w) + b
+    return x
+
+def do_linear(x,  LinearOp):
+    "return jnp.einsum(’npc,cd->npd’, x, w) + b"
+    "x  in [N,P,C], W in "
+    x = LinearOp(x)
+    return x
+
 
 class MLP_Block(nn.Module):
-    def __init__(self, in_shape, G):
+    def __init__(self, in_shape):
         super(MLP_Block, self).__init__()
-        b, c, h, w = in_shape
-        self.linear1 = nn.Linear(h * w, h * w)
-        self.linear2 = nn.Linear(c, c)
-        self.group_linear = nn.Linear(c // G, c // G)
+        n, P, G, C = in_shape
+        self.linear1 = nn.Linear(P, P)
+        self.linear2 = nn.Linear(C*G, C*G)
+
+
+        self.gW = torch.nn.Parameter(torch.randn(G, C, C), requires_grad=True)
+        self.gB = torch.nn.Parameter(torch.zeros( C), requires_grad=True)
+        ##torch.nn.init.normal_(self.gW, mean=0.0, std=np.sqrt(2/(num_groups*in_features2)))
+        torch.nn.init.normal_(self.gW, mean=0.0, std=np.sqrt(2/(C)))
+
+        self.act1 = torch.nn.ReLU()
+        self.act2 = torch.nn.ReLU()
+        self.act3 = torch.nn.ReLU()
 
     def forward(self, x):
         N, P, G, _ = x.shape
@@ -788,29 +798,119 @@ class MLP_Block(nn.Module):
         x = self.linear1(x)
         x = torch.swapaxes(x, 1, 2)
         x = normalize(x)
-        x = torch.nn.relu(x)
+        x = self.act1(x)
         # Channel mixing.
         x = normalize(x)
         x = self.linear2(x)
         x = normalize(x) # normalize_layer?
-        x = torch.nn.relu(x)
+        x = self.act2(x)
         x = torch.reshape(x, [N, P, G, -1])
         x = normalize(x)
-        x = self.group_linear(x)
+        x = do_group_linear(x,self.gW, self.gB) ## NxPxGxD2
         x = normalize(x)
-        # no reshaping?
         x = x + inputs
-        x = torch.nn.relu(x)
+        x = self.act3(x)
+        return x
+
+
+
+
+class Block0(nn.Module):
+    def __init__(self, num_groups, in_features1, in_features2, out_features):
+        super(Block0, self).__init__()
+        self.num_groups = num_groups
+
+        ## D0 = in_features2
+        ## D = out_features
+
+        self.linear1 = nn.Linear(in_features1, in_features2 * num_groups)
+
+        self.gW = torch.nn.Parameter(torch.randn(num_groups, in_features2, out_features), requires_grad=True)
+        self.gB = torch.nn.Parameter(torch.zeros( out_features), requires_grad=True)
+        ##torch.nn.init.normal_(self.gW, mean=0.0, std=np.sqrt(2/(num_groups*in_features2)))
+        torch.nn.init.normal_(self.gW, mean=0.0, std=np.sqrt(2/(in_features2)))
+
+        self.in_features1 = in_features1
+        self.in_features2 = in_features2
+
+        self.act1 = torch.nn.ReLU()
+        self.act2 = torch.nn.ReLU()
+
+
+    def forward(self, x):
+        N, P , C = x.shape
+
+        D = self.in_features1
+
+
+        G = self.num_groups
+
+        x = normalize(x) ##  NxPxC
+        x = do_linear(x,self.linear1) ## NxPx(D*G)
+        x = normalize(x) 
+        x = self.act1(x)
+        x = torch.reshape(x, [N, P, G, -1]) ## NxPxGxD
+        x = normalize(x)
+        x = do_group_linear(x,self.gW, self.gB) ## NxPxGxD2
+        x = normalize(x)
+        x = self.act2(x)
+
         return x
 
 class LocalMixer(nn.Module):
-    def __init__(self, num_blocks=1, in_shape, G):
+    def __init__(self, in_shape , num_blocks , G, widening, lamb = 0.0, classes= 10, first_layer= None):
         super(LocalMixer, self).__init__()
-        self.block0 = Block0()
-        self.blocks = torch.nn.ModuleList([MLP_Block(in_shape, G) for _ in range(num_blocks)])
-        self.linear = torch.nn.Linear()
+
+
+        N,P,C = in_shape
+
+        if  first_layer is None:
+            first_layer= C
+
+        D = first_layer* widening
+        D0  = first_layer
+        
+        self.blocks = torch.nn.ModuleList([Block0(G, C, D0, D) if i==0 else MLP_Block([N,P,G, D]) for i in range(num_blocks)])
+        self.local_linears = torch.nn.ModuleList([torch.nn.Linear(D, classes) for _ in range(num_blocks)])
+
+        self.linops= []
+
+        self.linear = torch.nn.Linear(D*G,classes)
 
     def forward(self, x):
+
+        # Build network blocks.
+
+        B = x.shape[0]
+        C = x.shape[1]
+
+        x = x.reshape(B, -1, C)
+        for blk in self.blocks:
+            x = blk(x)
+        x = torch.reshape(x, [x.shape[0], x.shape[1], -1])
+        x = torch.mean(x, dim=1)  # [N,C]
+        x = normalize(x)
+        pred = self.linear(x)
+        return pred
+
+
+    def forward_truncated(self, x):
+        pred_local = []  # Local predictions.
+        # Build network blocks.
+        x = self.block0(x)
+        for blk, local_linear in zip(self.blocks, self.local_linears):
+            x = blk(x)
+            pred_local.append(local_linear(x_proj))
+            # Disconnect gradients.
+            x = x.detach()
+        x = torch.reshape(x, [x.shape[0], x.shape[1], -1])
+        x = torch.mean(x, dim=1)  # [N,C]
+        x = normalize(x)
+        pred = self.linear(x)
+        return pred, pred_local
+
+
+    def forward_grad(self, x):
         pred_local = []  # Local predictions.
         # Build network blocks.
         x = self.block0(x)
